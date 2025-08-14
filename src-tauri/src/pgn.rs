@@ -259,7 +259,6 @@ pub async fn delete_game(
             Ok(())
         })
     })
-    })
     .await
     .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
 
@@ -311,9 +310,19 @@ where
         .lock()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
 
-    // Open original and acquire exclusive OS-level lock
+    // Open original and acquire exclusive OS-level lock. Wrap the file
+    // handle in a small RAII type so we always attempt to unlock when the
+    // guard is dropped (covers early returns on errors).
+    struct UnlockOnDrop(File);
+    impl Drop for UnlockOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.unlock();
+        }
+    }
+
     let orig = OpenOptions::new().read(true).write(true).open(&file_clone)?;
     orig.lock_exclusive()?;
+    let mut orig_guard = UnlockOnDrop(orig);
 
     let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -327,8 +336,8 @@ where
     tmp.persist(&file_clone)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
 
-    let _ = orig.unlock();
-    drop(orig);
+    // explicitly drop the guard to unlock before returning
+    drop(orig_guard);
 
     Ok(())
 }
@@ -368,7 +377,6 @@ pub async fn write_game(
             write_to_end(&mut parser.reader, tmp.as_file_mut())?;
             Ok(())
         })
-    })
     })
     .await
     .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
