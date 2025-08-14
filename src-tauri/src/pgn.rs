@@ -251,59 +251,14 @@ pub async fn delete_game(
     let file_clone = file.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), Error> {
-        let mut parser = PgnParser::new(File::open(&file_clone)?)?;
-        parser.offset_by_index(n as usize, &pgn_offsets, &pgn_meta, &file_to_key(&file_clone))?;
-
-        let files_string = file_to_key(&file_clone);
-
-        // Acquire an in-process lock object (Arc<Mutex<()>>) and then lock it
-        // inside this blocking thread so the guard is not sent across await.
-        let lock_arc: Arc<Mutex<()>> = match pgn_locks.get(&files_string) {
-            Some(v) => v.clone(),
-            None => {
-                let a = Arc::new(Mutex::new(()));
-                pgn_locks.insert(files_string.clone(), a.clone());
-                a
-            }
-        };
-        let _guard = lock_arc.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
-
-        let starting_bytes = parser.position()?;
-        parser.skip_games(1)?;
-
-        // Open the original file for read+write and acquire an exclusive
-        // OS-level lock so other processes cannot modify it while we
-        // prepare and atomically replace it. Use write access to make the
-        // intent explicit on platforms that require it for exclusive
-        // locking.
-        let orig = OpenOptions::new().read(true).write(true).open(&file_clone)?;
-        orig.lock_exclusive()?;
-
-        // Create a temporary file in the same directory and write the data we
-        // want to keep (everything after the removed game).
-        let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-
-        // Copy data after the removed game into tmp.
-        tmp.seek(SeekFrom::Start(0))?;
-        // parser.reader is positioned after the skipped game; copy the rest
-        write_to_end(&mut parser.reader, tmp.as_file_mut())?;
-
-        // Ensure temp file data is flushed to disk before renaming.
-        tmp.as_file_mut().sync_all()?;
-
-        // Persist the temp file over the original path (atomic on same fs).
-        tmp.persist(&file_clone)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
-
-        // Release the exclusive lock on the original file. We attempt to
-        // unlock explicitly, then drop the handle to close it. Ignore
-        // unlock errors and propagate only I/O errors from the critical
-        // operations above.
-        let _ = orig.unlock();
-        drop(orig);
-
-        Ok(())
+        atomic_replace(&file_clone, n as usize, &pgn_offsets, &pgn_meta, &pgn_locks, |parser, tmp| {
+            // parser is positioned at the requested index; skip the game to remove
+            parser.skip_games(1)?;
+            // parser.reader is positioned after the skipped game; copy the rest
+            write_to_end(&mut parser.reader, tmp.as_file_mut())?;
+            Ok(())
+        })
+    })
     })
     .await
     .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
@@ -397,47 +352,23 @@ pub async fn write_game(
     let pgn_clone = pgn.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), Error> {
-        // open and position parser
-        let mut parser = PgnParser::new(File::open(&file_clone)?)?;
-        parser.offset_by_index(n as usize, &pgn_offsets, &pgn_meta, &file_to_key(&file_clone))?;
+        atomic_replace(&file_clone, n as usize, &pgn_offsets, &pgn_meta, &pgn_locks, |parser, tmp| {
+            // copy head up to insertion point
+            let insert_pos = parser.position()?;
+            let mut f = File::open(&file_clone)?;
+            f.seek(SeekFrom::Start(0))?;
+            let mut head = f.take(insert_pos);
+            io::copy(&mut head, tmp.as_file_mut())?;
 
-        let files_string = file_to_key(&file_clone);
+            // write new pgn
+            tmp.as_file_mut().write_all(pgn_clone.as_bytes())?;
 
-        let lock_arc: Arc<Mutex<()>> = match pgn_locks.get(&files_string) {
-            Some(v) => v.clone(),
-            None => {
-                let a = Arc::new(Mutex::new(()));
-                pgn_locks.insert(files_string.clone(), a.clone());
-                a
-            }
-        };
-        let _guard = lock_arc.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
-
-        // Acquire exclusive OS-level lock on the original file
-        let orig = OpenOptions::new().read(true).open(&file_clone)?;
-        orig.lock_exclusive()?;
-
-        let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-
-        // copy head up to insertion point
-        let insert_pos = parser.position()?;
-        let mut f = File::open(&file_clone)?;
-        f.seek(SeekFrom::Start(0))?;
-        let mut head = f.take(insert_pos);
-        io::copy(&mut head, tmp.as_file_mut())?;
-
-        // write new pgn
-        tmp.as_file_mut().write_all(pgn_clone.as_bytes())?;
-
-        // skip the game to be replaced in original and copy the remainder
-        parser.skip_games(1)?;
-        write_to_end(&mut parser.reader, tmp.as_file_mut())?;
-
-        tmp.persist(&file_clone)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
-
-        Ok(())
+            // skip the game to be replaced in original and copy the remainder
+            parser.skip_games(1)?;
+            write_to_end(&mut parser.reader, tmp.as_file_mut())?;
+            Ok(())
+        })
+    })
     })
     .await
     .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
