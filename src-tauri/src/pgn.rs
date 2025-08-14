@@ -318,6 +318,65 @@ fn write_to_end<R: Read>(reader: &mut R, writer: &mut File) -> io::Result<()> {
     Ok(())
 }
 
+
+// Helper to centralize the pattern of acquiring the in-process lock,
+// taking an exclusive OS lock on the target file, writing to a temporary
+// file in the same directory, syncing, and atomically replacing the
+// original file. The closure `op` is responsible for writing the desired
+// contents into the provided temp file using the positioned `PgnParser`.
+fn atomic_replace<F>(
+    file_clone: &Path,
+    index: usize,
+    pgn_offsets: &dashmap::DashMap<String, Vec<u64>>,
+    pgn_meta: &dashmap::DashMap<String, (u64, u64)>,
+    pgn_locks: &dashmap::DashMap<String, Arc<Mutex<()>>>,
+    mut op: F,
+) -> Result<(), Error>
+where
+    F: FnOnce(&mut PgnParser, &mut tempfile::NamedTempFile) -> io::Result<()>,
+{
+    // open and position parser
+    let mut parser = PgnParser::new(File::open(&file_clone)?)?;
+    parser.offset_by_index(index, pgn_offsets, pgn_meta, &file_to_key(&file_clone))?;
+
+    let files_string = file_to_key(&file_clone);
+
+    // Acquire an in-process lock object (Arc<Mutex<()>>) and then lock it
+    // so the guard is held while we perform OS-level locking and file
+    // replacement.
+    let lock_arc: Arc<Mutex<()>> = match pgn_locks.get(&files_string) {
+        Some(v) => v.clone(),
+        None => {
+            let a = Arc::new(Mutex::new(()));
+            pgn_locks.insert(files_string.clone(), a.clone());
+            a
+        }
+    };
+    let _guard = lock_arc
+        .lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
+
+    // Open original and acquire exclusive OS-level lock
+    let orig = OpenOptions::new().read(true).write(true).open(&file_clone)?;
+    orig.lock_exclusive()?;
+
+    let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+
+    // Call the provided closure to populate tmp using parser state.
+    op(&mut parser, &mut tmp)?;
+
+    // Ensure temp file data is flushed before rename
+    tmp.as_file_mut().sync_all()?;
+
+    tmp.persist(&file_clone)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
+
+    let _ = orig.unlock();
+    drop(orig);
+
+    Ok(())
+}
 #[tauri::command]
 #[specta::specta]
 pub async fn write_game(
