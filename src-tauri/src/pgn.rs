@@ -5,6 +5,8 @@ use std::{
 };
 
 use crate::{error::Error, AppState};
+use fs2::FileExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -33,23 +35,42 @@ impl PgnParser {
         self.reader.stream_position()
     }
 
-    fn offset_by_index(&mut self, n: usize, state: &AppState, file: &str) -> io::Result<()> {
+    fn offset_by_index(
+        &mut self,
+        n: usize,
+        pgn_offsets: &dashmap::DashMap<String, Vec<u64>>,
+        pgn_meta: &dashmap::DashMap<String, (u64, u64)>,
+        file: &str,
+    ) -> io::Result<()> {
         let offset_index = n / GAME_OFFSET_FREQ;
         let n_left = n % GAME_OFFSET_FREQ;
-        // Look up precomputed offsets for this file, if available. The offsets map
-        // is keyed by the canonicalized file path string. If offsets are missing
-        // or the requested index is out of range, fall back to scanning from the
-        // file start which is slower but safe.
-        if let Some(pgn_offsets) = state.pgn_offsets.get(file) {
-            if offset_index == 0 || offset_index <= pgn_offsets.len() {
-                let offset = if offset_index == 0 {
-                    self.start
-                } else {
-                    pgn_offsets[offset_index - 1]
-                };
 
-                self.reader.seek(SeekFrom::Start(offset))?;
-                self.skip_games(n_left)?;
+        // Validate offsets against stored file metadata; if the file changed
+        // since the offsets were computed, fall back to scanning from start.
+        if let Some(offsets_ro) = pgn_offsets.get(file) {
+            let mut use_offsets = true;
+            if let Some(meta_ro) = pgn_meta.get(file) {
+                if let Ok(curr) = get_file_meta(Path::new(file)) {
+                    if *meta_ro != curr {
+                        use_offsets = false;
+                    }
+                }
+            }
+
+            if use_offsets {
+                let offsets = offsets_ro.value();
+                if offset_index == 0 || offset_index <= offsets.len() {
+                    let offset = if offset_index == 0 {
+                        self.start
+                    } else {
+                        offsets[offset_index - 1]
+                    };
+                    self.reader.seek(SeekFrom::Start(offset))?;
+                    self.skip_games(n_left)?;
+                } else {
+                    self.reader.seek(SeekFrom::Start(self.start))?;
+                    self.skip_games(n)?;
+                }
             } else {
                 self.reader.seek(SeekFrom::Start(self.start))?;
                 self.skip_games(n)?;
@@ -79,7 +100,7 @@ impl PgnParser {
             if bytes == 0 {
                 break;
             }
-            if line.starts_with('[') {
+            if line.trim_start().starts_with('[') {
                 if new_game {
                     count += 1;
                     if count == n {
@@ -104,7 +125,7 @@ impl PgnParser {
             if bytes == 0 {
                 break;
             }
-            if self.line.starts_with('[') {
+            if self.line.trim_start().starts_with('[') {
                 if new_game {
                     break;
                 }
@@ -134,6 +155,18 @@ fn file_to_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
+
+fn get_file_meta(path: &Path) -> io::Result<(u64, u64)> {
+    let md = std::fs::metadata(path)?;
+    let modified = md
+        .modified()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("modified error: {}", e)))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("systemtime error: {}", e)))?
+        .as_secs();
+    let len = md.len();
+    Ok((modified, len))
+}
 #[tauri::command]
 #[specta::specta]
 pub async fn count_pgn_games(
@@ -141,10 +174,11 @@ pub async fn count_pgn_games(
     state: tauri::State<'_, AppState>,
 ) -> Result<i32, Error> {
     let files_string = file_to_key(&file);
+    let path = file.clone();
 
-    let file = File::open(&file)?;
+    let file_handle = File::open(&path)?;
 
-    let mut parser = PgnParser::new(file.try_clone()?)?;
+    let mut parser = PgnParser::new(file_handle.try_clone()?)?;
 
     let mut offsets = Vec::new();
 
@@ -161,7 +195,10 @@ pub async fn count_pgn_games(
         }
     }
 
-    state.pgn_offsets.insert(files_string, offsets);
+    state.pgn_offsets.insert(files_string.clone(), offsets);
+    if let Ok(meta) = get_file_meta(&path) {
+        state.pgn_index_meta.insert(files_string, meta);
+    }
     Ok(count)
 }
 
@@ -177,7 +214,12 @@ pub async fn read_games(
 
     let mut parser = PgnParser::new(file_r.try_clone()?)?;
     let files_string = file_to_key(&file);
-    parser.offset_by_index(start as usize, &state, &files_string)?;
+    parser.offset_by_index(
+        start as usize,
+        &state.pgn_offsets,
+        &state.pgn_index_meta,
+        &files_string,
+    )?;
 
     let mut games: Vec<String> = Vec::with_capacity((end - start) as usize);
 
@@ -200,30 +242,59 @@ pub async fn delete_game(
 ) -> Result<(), Error> {
     let file_r = File::open(&file)?;
 
-    let mut parser = PgnParser::new(file_r.try_clone()?)?;
-    let files_string = file_to_key(&file);
-    parser.offset_by_index(n as usize, &state, &files_string)?;
+    // For modifications we perform the work in a blocking task to avoid
+    // blocking the async runtime. Clone the small pieces we need from the
+    // shared state so they can be moved into the blocking closure.
+    let pgn_offsets = state.pgn_offsets.clone();
+    let pgn_meta = state.pgn_index_meta.clone();
+    let pgn_locks = state.pgn_locks.clone();
+    let file_clone = file.clone();
 
-    // Acquire per-file lock to serialize modifications to this PGN file.
-    let lock_arc: Arc<Mutex<()>> = match state.pgn_locks.get(&files_string) {
-        Some(v) => v.clone(),
-        None => {
-            let a = Arc::new(Mutex::new(()));
-            state.pgn_locks.insert(files_string.clone(), a.clone());
-            a
-        }
-    };
-    let _guard = lock_arc.lock().unwrap();
+    tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        let mut parser = PgnParser::new(File::open(&file_clone)?)?;
+        parser.offset_by_index(n as usize, &pgn_offsets, &pgn_meta, &file_to_key(&file_clone))?;
 
-    let starting_bytes = parser.position()?;
+        let files_string = file_to_key(&file_clone);
 
-    parser.skip_games(1)?;
+        // Acquire an in-process lock object (Arc<Mutex<()>>) and then lock it
+        // inside this blocking thread so the guard is not sent across await.
+        let lock_arc: Arc<Mutex<()>> = match pgn_locks.get(&files_string) {
+            Some(v) => v.clone(),
+            None => {
+                let a = Arc::new(Mutex::new(()));
+                pgn_locks.insert(files_string.clone(), a.clone());
+                a
+            }
+        };
+        let _guard = lock_arc.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
 
-    let mut file_w = OpenOptions::new().write(true).open(file)?;
+        let starting_bytes = parser.position()?;
+        parser.skip_games(1)?;
 
-    file_w.seek(SeekFrom::Start(starting_bytes))?;
+        // Open the original file and acquire an exclusive OS-level lock so
+        // other processes cannot modify it while we replace it.
+        let orig = OpenOptions::new().read(true).open(&file_clone)?;
+        orig.lock_exclusive()?;
 
-    write_to_end(&mut parser.reader, &mut file_w)?;
+        // Create a temporary file in the same directory and write the data we
+        // want to keep (everything after the removed game).
+        let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+
+        // Copy data after the removed game into tmp.
+        tmp.seek(SeekFrom::Start(0))?;
+        // parser.reader is positioned after the skipped game; copy the rest
+        write_to_end(&mut parser.reader, tmp.as_file_mut())?;
+
+        // Persist the temp file over the original path (atomic on same fs).
+        tmp.persist(&file_clone)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
+
     Ok(())
 }
 
@@ -246,37 +317,58 @@ pub async fn write_game(
         File::create(&file)?;
     }
 
-    let file_r = File::open(&file)?;
-    let mut file_w = OpenOptions::new().write(true).open(&file)?;
+    // perform the write in a blocking task
+    let pgn_offsets = state.pgn_offsets.clone();
+    let pgn_meta = state.pgn_index_meta.clone();
+    let pgn_locks = state.pgn_locks.clone();
+    let file_clone = file.clone();
+    let pgn_clone = pgn.clone();
 
-    let mut tmpf = tempfile::tempfile()?;
-    io::copy(&mut file_r.try_clone()?, &mut tmpf)?;
+    tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        // open and position parser
+        let mut parser = PgnParser::new(File::open(&file_clone)?)?;
+        parser.offset_by_index(n as usize, &pgn_offsets, &pgn_meta, &file_to_key(&file_clone))?;
 
-    let mut parser = PgnParser::new(file_r.try_clone()?)?;
-    let files_string = file_to_key(&file);
-    parser.offset_by_index(n as usize, &state, &files_string)?;
+        let files_string = file_to_key(&file_clone);
 
-    // Acquire per-file lock to serialize modifications to this PGN file.
-    let lock_arc: Arc<Mutex<()>> = match state.pgn_locks.get(&files_string) {
-        Some(v) => v.clone(),
-        None => {
-            let a = Arc::new(Mutex::new(()));
-            state.pgn_locks.insert(files_string.clone(), a.clone());
-            a
-        }
-    };
-    let _guard = lock_arc.lock().unwrap();
+        let lock_arc: Arc<Mutex<()>> = match pgn_locks.get(&files_string) {
+            Some(v) => v.clone(),
+            None => {
+                let a = Arc::new(Mutex::new(()));
+                pgn_locks.insert(files_string.clone(), a.clone());
+                a
+            }
+        };
+        let _guard = lock_arc.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
 
-    tmpf.seek(SeekFrom::Start(parser.position()?))?;
-    tmpf.write_all(pgn.as_bytes())?;
+        // Acquire exclusive OS-level lock on the original file
+        let orig = OpenOptions::new().read(true).open(&file_clone)?;
+        orig.lock_exclusive()?;
 
-    parser.skip_games(1)?;
+        let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
 
-    write_to_end(&mut parser.reader, &mut tmpf)?;
+        // copy head up to insertion point
+        let insert_pos = parser.position()?;
+        let mut f = File::open(&file_clone)?;
+        f.seek(SeekFrom::Start(0))?;
+        let mut head = f.take(insert_pos);
+        io::copy(&mut head, tmp.as_file_mut())?;
 
-    tmpf.seek(SeekFrom::Start(0))?;
+        // write new pgn
+        tmp.as_file_mut().write_all(pgn_clone.as_bytes())?;
 
-    write_to_end(&mut tmpf, &mut file_w)?;
+        // skip the game to be replaced in original and copy the remainder
+        parser.skip_games(1)?;
+        write_to_end(&mut parser.reader, tmp.as_file_mut())?;
+
+        tmp.persist(&file_clone)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, format!("join error: {}", e))))??;
 
     Ok(())
 }
@@ -344,6 +436,7 @@ mod tests {
         let db_cache = std::sync::Mutex::new(Vec::new());
         let new_request = Arc::new(tokio::sync::Semaphore::new(2));
         let pgn_offsets = DashMap::new();
+        let pgn_index_meta = DashMap::new();
         let fide_players = tokio::sync::RwLock::new(Vec::new());
         let engine_processes = DashMap::new();
         let pgn_locks = DashMap::new();
@@ -371,6 +464,7 @@ mod tests {
             db_cache,
             new_request,
             pgn_offsets,
+            pgn_index_meta,
             pgn_locks,
             fide_players,
             engine_processes,
@@ -381,15 +475,60 @@ mod tests {
 
         // test offset_by_index positions parser at the precomputed offset
         let mut parser = PgnParser::new(File::open(&file)?)?;
-        parser.offset_by_index(100, &state, &key)?;
+        parser.offset_by_index(100, &state.pgn_offsets, &state.pgn_index_meta, &key)?;
         let pos = parser.position()?;
         assert_eq!(pos, offset);
 
         // index 101 should be positioned after that offset
-        parser.offset_by_index(101, &state, &key)?;
+        parser.offset_by_index(101, &state.pgn_offsets, &state.pgn_index_meta, &key)?;
         let pos2 = parser.position()?;
         assert!(pos2 > offset);
 
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_bom_and_read_game() -> std::io::Result<()> {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bom.pgn");
+        let mut f = File::create(&file)?;
+
+        // write BOM then a simple tagged game
+        f.write_all(&[0xEF, 0xBB, 0xBF])?;
+        writeln!(f, "[Event \"BOM Test\"]")?;
+        writeln!(f, "\n1. e4 e5\n")?;
+        f.flush()?;
+
+        let mut parser = PgnParser::new(File::open(&file)?)?;
+        let game = parser.read_game()?;
+        
+        assert!(game.contains("1. e4 e5"));
+        Ok(())
+    }
+
+    #[test]
+    fn leading_whitespace_tags_are_recognized() -> std::io::Result<()> {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lead.pgn");
+        let mut f = File::create(&file)?;
+
+        // two games with leading whitespace before tags
+        for _ in 0..2 {
+            writeln!(f, "   [Event \"Lead\"]")?;
+            writeln!(f, "   \n1. e4 e5\n")?;
+        }
+        f.flush()?;
+
+        let mut parser = PgnParser::new(File::open(&file)?)?;
+        let first = parser.read_game()?;
+        
+        let second = parser.read_game()?;
+        
+        assert!(first.contains("1. e4 e5") && second.contains("1. e4 e5"));
         Ok(())
     }
 }
