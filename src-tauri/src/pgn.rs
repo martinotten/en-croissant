@@ -543,3 +543,86 @@ mod tests {
         Ok(())
     }
 }
+
+    #[test]
+    fn atomic_replace_op_failure_releases_lock() -> std::io::Result<()> {
+        use std::io::Write;
+        use std::fs::OpenOptions;
+        use dashmap::DashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("atomic_fail.pgn");
+        let mut f = File::create(&file)?;
+        writeln!(f, "[Event \"X\"]")?;
+        writeln!(f, "1. e4 e5")?;
+        f.flush()?;
+
+        let pgn_offsets: DashMap<String, Vec<u64>> = DashMap::new();
+        let pgn_meta: DashMap<String, (u64, u64)> = DashMap::new();
+        let pgn_locks: DashMap<String, Arc<Mutex<()>>> = DashMap::new();
+
+        // Force the op closure to return an error.
+        let res = atomic_replace(
+            &file,
+            0,
+            &pgn_offsets,
+            &pgn_meta,
+            &pgn_locks,
+            |_parser, _tmp| Err(std::io::Error::new(std::io::ErrorKind::Other, "boom")),
+        );
+
+        assert!(res.is_err());
+
+        // Ensure the OS-level lock has been released by attempting a non-blocking
+        // exclusive lock on the file.
+        let mut f2 = OpenOptions::new().read(true).write(true).open(&file)?;
+        f2.try_lock_exclusive()?;
+        f2.unlock()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_replace_concurrent_writers_atomic_replacement() -> std::io::Result<()> {
+        use std::io::Write;
+        use dashmap::DashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("atomic_concurrent.pgn");
+        let mut f = File::create(&file)?;
+        writeln!(f, "[Event \"Init\"]")?;
+        writeln!(f, "1. e4 e5")?;
+        f.flush()?;
+
+        let pgn_offsets: DashMap<String, Vec<u64>> = DashMap::new();
+        let pgn_meta: DashMap<String, (u64, u64)> = DashMap::new();
+        let pgn_locks: DashMap<String, Arc<Mutex<()>>> = DashMap::new();
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let file2 = file.clone();
+                let offs = pgn_offsets.clone();
+                let meta = pgn_meta.clone();
+                let locks = pgn_locks.clone();
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    let content = format!("writer-{}", i);
+                    atomic_replace(&file2, 0, &offs, &meta, &locks, |_parser, tmp| {
+                        tmp.as_file_mut().write_all(content.as_bytes())?;
+                        Ok(())
+                    })
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().expect("thread panicked")?;
+        }
+
+        let final_content = std::fs::read_to_string(&file)?;
+        // final content should match one of the writers exactly
+        let ok = (0..8).any(|i| final_content == format!("writer-{}", i));
+        assert!(ok, "final content not from any writer: {}", final_content);
+
+        Ok(())
+    }
