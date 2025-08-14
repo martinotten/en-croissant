@@ -271,9 +271,12 @@ pub async fn delete_game(
         let starting_bytes = parser.position()?;
         parser.skip_games(1)?;
 
-        // Open the original file and acquire an exclusive OS-level lock so
-        // other processes cannot modify it while we replace it.
-        let orig = OpenOptions::new().read(true).open(&file_clone)?;
+        // Open the original file for read+write and acquire an exclusive
+        // OS-level lock so other processes cannot modify it while we
+        // prepare and atomically replace it. Use write access to make the
+        // intent explicit on platforms that require it for exclusive
+        // locking.
+        let orig = OpenOptions::new().read(true).write(true).open(&file_clone)?;
         orig.lock_exclusive()?;
 
         // Create a temporary file in the same directory and write the data we
@@ -286,9 +289,19 @@ pub async fn delete_game(
         // parser.reader is positioned after the skipped game; copy the rest
         write_to_end(&mut parser.reader, tmp.as_file_mut())?;
 
+        // Ensure temp file data is flushed to disk before renaming.
+        tmp.as_file_mut().sync_all()?;
+
         // Persist the temp file over the original path (atomic on same fs).
         tmp.persist(&file_clone)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("persist error: {}", e)))?;
+
+        // Release the exclusive lock on the original file. We attempt to
+        // unlock explicitly, then drop the handle to close it. Ignore
+        // unlock errors and propagate only I/O errors from the critical
+        // operations above.
+        let _ = orig.unlock();
+        drop(orig);
 
         Ok(())
     })
