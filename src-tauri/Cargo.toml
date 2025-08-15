@@ -44,6 +44,7 @@ vampirc-uci = { git = "https://github.com/franciscoBSalgueiro/vampirc-uci", rev 
     "serde",
 ] }
 tempfile = "3.6.0"
+fs2 = "0.4"
 quick-xml = { version = "0.31.0", features = ["serialize"] }
 specta = { version = "^2.0.0-rc.20", features = ["derive"] }
 tauri-specta = { version = "^2.0.0-rc.20", features = ["derive", "typescript"] }
@@ -54,6 +55,7 @@ log = "0.4.20"
 oauth2 = "4.4.2"
 axum = "0.6.20"
 tar = "0.4.40"
+flate2 = "1.0"
 sysinfo = "0.29.10"
 governor = "0.6.3"
 nonzero_ext = "0.3.0"

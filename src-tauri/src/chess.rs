@@ -761,7 +761,7 @@ fn count_material(position: &Chess) -> i32 {
 
 fn piece_value(role: Role) -> i32 {
     match role {
-        Role::Pawn => 90,
+        Role::Pawn => 100,
         Role::Knight => 300,
         Role::Bishop => 300,
         Role::Rook => 500,
@@ -804,15 +804,15 @@ fn qsearch(position: &Chess, mut alpha: i32, beta: i32) -> i32 {
 }
 
 fn naive_eval(pos: &Chess) -> i32 {
-    pos.legal_moves()
-        .iter()
-        .map(|mv| {
-            let mut new_position = pos.clone();
-            new_position.play_unchecked(mv);
-            -qsearch(&new_position, i32::MIN, i32::MAX)
-        })
-        .max()
-        .unwrap_or(i32::MIN)
+    let mut scores = Vec::new();
+    for mv in pos.legal_moves().iter() {
+        let mut new_position = pos.clone();
+        new_position.play_unchecked(mv);
+        let sc = -qsearch(&new_position, i32::MIN, i32::MAX);
+        println!("debug: naive_eval move={:?} score={}", mv, sc);
+        scores.push(sc);
+    }
+    *scores.iter().max().unwrap_or(&i32::MIN)
 }
 
 #[cfg(test)]
@@ -858,13 +858,17 @@ mod tests {
     #[test]
     fn eval_rook_stack() {
         let position = pos("rnrq4/8/8/1R6/1R6/1R5K/1Q6/7k w - - 0 1");
-        assert_eq!(naive_eval(&position), 500);
+        let val = naive_eval(&position);
+        println!("debug: eval_rook_stack -> {}", val);
+        assert_eq!(val, 500);
     }
 
     #[test]
     fn eval_rook_stack2() {
         let position = pos("rnrq4/8/8/1R6/1Q6/1R5K/1R6/7k w - - 0 1");
-        assert_eq!(naive_eval(&position), 200);
+        let val = naive_eval(&position);
+        println!("debug: eval_rook_stack2 -> {}", val);
+        assert_eq!(val, 200);
     }
 
     #[test]

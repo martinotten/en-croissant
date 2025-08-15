@@ -80,6 +80,7 @@ pub struct AppState {
     #[derivative(Default(value = "Arc::new(Semaphore::new(2))"))]
     new_request: Arc<Semaphore>,
     pgn_offsets: DashMap<String, Vec<u64>>,
+    pgn_index_meta: DashMap<String, (u64, u64)>,
     pgn_locks: DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
     fide_players: RwLock<Vec<FidePlayer>>,
     engine_processes: DashMap<(String, String), Arc<tokio::sync::Mutex<EngineProcess>>>,

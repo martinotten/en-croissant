@@ -92,7 +92,6 @@ pub async fn download_fide_db(
         app.clone(),
         None,
         Some(false),
-        None,
     )
     .await?;
 
