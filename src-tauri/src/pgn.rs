@@ -256,7 +256,7 @@ pub async fn delete_game(
     n: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), Error> {
-    let file_r = File::open(&file)?;
+    let _file_r = File::open(&file)?;
 
     // For modifications we perform the work in a blocking task to avoid
     // blocking the async runtime. Clone the small pieces we need from the
@@ -311,7 +311,7 @@ fn atomic_replace<F>(
     pgn_offsets: &dashmap::DashMap<String, Vec<u64>>,
     pgn_meta: &dashmap::DashMap<String, (u64, u64)>,
     pgn_locks: &dashmap::DashMap<String, Arc<Mutex<()>>>,
-    mut op: F,
+    op: F,
 ) -> Result<(), Error>
 where
     F: FnOnce(&mut PgnParser, &mut tempfile::NamedTempFile) -> io::Result<()>,
@@ -352,7 +352,7 @@ where
         .write(true)
         .open(&file_clone)?;
     orig.lock_exclusive()?;
-    let mut orig_guard = UnlockOnDrop(orig);
+    let orig_guard = UnlockOnDrop(orig);
 
     let dir = file_clone.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;

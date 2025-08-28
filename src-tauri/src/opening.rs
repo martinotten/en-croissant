@@ -9,6 +9,7 @@ use strsim::{jaro_winkler, sorensen_dice};
 use crate::error::Error;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Opening {
     eco: String,
     name: String,

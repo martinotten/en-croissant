@@ -16,11 +16,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
-use vampirc_uci::{
-    parse_one,
-    uci::{Score, ScoreValue},
-    UciInfoAttribute, UciMessage, UciOptionConfig,
-};
+use vampirc_uci::{parse_one, UciInfoAttribute, UciMessage, UciOptionConfig};
 
 use crate::{
     db::{is_position_in_db, GameQueryJs, PositionQueryJs},
@@ -33,6 +29,14 @@ use crate::{
 pub enum EngineLog {
     Gui(String),
     Engine(String),
+}
+
+#[derive(Clone, Serialize, Debug, Default, Type)]
+pub struct ScoreInfo {
+    pub cp: Option<i32>,
+    pub mate: Option<i8>,
+    pub lower_bound: Option<bool>,
+    pub upper_bound: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -217,20 +221,14 @@ impl EngineProcess {
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AnalysisCacheKey {
-    pub tab: String,
-    pub fen: String,
-    pub engine: String,
-    pub multipv: u16,
-}
+// AnalysisCacheKey removed (unused)
 
 #[derive(Clone, Serialize, Debug, Derivative, Type)]
 #[derivative(Default)]
 pub struct BestMoves {
     nodes: u32,
     depth: u32,
-    score: Score,
+    score: ScoreInfo,
     #[serde(rename = "uciMoves")]
     uci_moves: Vec<String>,
     #[serde(rename = "sanMoves")]
@@ -251,16 +249,12 @@ pub struct BestMovesPayload {
     pub progress: f64,
 }
 
-fn invert_score(score: Score) -> Score {
-    let new_value = match score.value {
-        ScoreValue::Cp(x) => ScoreValue::Cp(-x),
-        ScoreValue::Mate(x) => ScoreValue::Mate(-x),
-    };
-    let new_wdl = score.wdl.map(|(w, d, l)| (l, d, w));
-    Score {
-        value: new_value,
-        wdl: new_wdl,
-        ..score
+fn invert_score(score: ScoreInfo) -> ScoreInfo {
+    ScoreInfo {
+        cp: score.cp.map(|x| -x),
+        mate: score.mate.map(|m| -m),
+        lower_bound: score.lower_bound,
+        upper_bound: score.upper_bound,
     }
 }
 
@@ -300,13 +294,13 @@ fn parse_uci_attrs(
                 best_moves.nodes = nodes as u32;
             }
             UciInfoAttribute::Depth(depth) => {
-                best_moves.depth = depth;
+                best_moves.depth = depth as u32;
             }
             UciInfoAttribute::MultiPv(multipv) => {
                 best_moves.multipv = multipv;
             }
-            UciInfoAttribute::Score(score) => {
-                best_moves.score = score;
+            UciInfoAttribute::Score { cp, mate, lower_bound, upper_bound } => {
+                best_moves.score = ScoreInfo { cp, mate, lower_bound, upper_bound };
             }
             _ => (),
         }
@@ -887,7 +881,22 @@ mod tests {
 #[derive(Type, Default, Serialize, Debug)]
 pub struct EngineConfig {
     pub name: String,
-    pub options: Vec<UciOptionConfig>,
+    pub options: Vec<EngineOptionConfig>,
+}
+
+#[derive(Type, Default, Serialize, Debug)]
+pub struct EngineOptionConfig {
+    pub name: String,
+    #[specta(optional)]
+    pub typ: String,
+    #[specta(optional)]
+    pub default: Option<String>,
+    #[specta(optional)]
+    pub min: Option<i64>,
+    #[specta(optional)]
+    pub max: Option<i64>,
+    #[specta(optional)]
+    pub vars: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -910,7 +919,49 @@ pub async fn get_engine_config(path: PathBuf) -> Result<EngineConfig, Error> {
                 config.name = name;
             }
             if let UciMessage::Option(opt) = parse_one(&line) {
-                config.options.push(opt);
+                let e = match opt {
+                    UciOptionConfig::Check { name, default } => EngineOptionConfig {
+                        name,
+                        typ: "check".to_string(),
+                        default: default.map(|b| b.to_string()),
+                        min: None,
+                        max: None,
+                        vars: None,
+                    },
+                    UciOptionConfig::Spin { name, default, min, max } => EngineOptionConfig {
+                        name,
+                        typ: "spin".to_string(),
+                        default: default.map(|v| v.to_string()),
+                        min,
+                        max,
+                        vars: None,
+                    },
+                    UciOptionConfig::Combo { name, default, var } => EngineOptionConfig {
+                        name,
+                        typ: "combo".to_string(),
+                        default,
+                        min: None,
+                        max: None,
+                        vars: Some(var),
+                    },
+                    UciOptionConfig::Button { name } => EngineOptionConfig {
+                        name,
+                        typ: "button".to_string(),
+                        default: None,
+                        min: None,
+                        max: None,
+                        vars: None,
+                    },
+                    UciOptionConfig::String { name, default } => EngineOptionConfig {
+                        name,
+                        typ: "string".to_string(),
+                        default,
+                        min: None,
+                        max: None,
+                        vars: None,
+                    },
+                };
+                config.options.push(e);
             }
             if let UciMessage::UciOk = parse_one(&line) {
                 break;

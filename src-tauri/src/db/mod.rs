@@ -53,6 +53,7 @@ use self::encoding::encode_move;
 pub use self::models::NormalizedGame;
 pub use self::models::Puzzle;
 pub use self::schema::puzzles;
+#[allow(unused_imports)]
 pub use self::search::{
     is_position_in_db, search_position, PositionQuery, PositionQueryJs, PositionStats,
 };
@@ -181,12 +182,7 @@ impl Default for MaterialColor {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
-pub struct TempPlayer {
-    id: usize,
-    name: Option<String>,
-    rating: Option<i32>,
-}
+// TempPlayer removed (unused)
 
 #[derive(Default, Debug)]
 pub struct TempGame {
@@ -668,20 +664,7 @@ pub struct QueryOptions<SortT> {
     pub direction: SortDirection,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct GameQuery {
-    pub options: Option<QueryOptions<GameSort>>,
-    pub player1: Option<i32>,
-    pub player2: Option<i32>,
-    pub tournament_id: Option<i32>,
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
-    pub range1: Option<(i32, i32)>,
-    pub range2: Option<(i32, i32)>,
-    pub sides: Option<Sides>,
-    pub outcome: Option<String>,
-    pub position: Option<PositionQuery>,
-}
+// GameQuery removed (unused)
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Hash, Type)]
 pub struct GameQueryJs {

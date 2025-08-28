@@ -66,8 +66,6 @@ pub enum Error {
     #[error("No moves found")]
     NoMovesFound,
 
-    #[error("Lower or upper bound")]
-    LowerOrUpperBound,
 
     #[error("Search stopped")]
     SearchStopped,
@@ -87,11 +85,6 @@ pub enum Error {
     #[error("Players aren't the same. They have played against each other")]
     NotDistinctPlayers,
 
-    #[error("Security error: {0}")]
-    SecurityError(String),
-
-    #[error("Invalid path: {0}")]
-    InvalidPath(String),
 }
 
 impl serde::Serialize for Error {
