@@ -1,6 +1,6 @@
 use dashmap::{mapref::entry::Entry, DashMap};
 use diesel::prelude::*;
-use log::info;
+use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use shakmaty::{fen::Fen, san::SanPlus, Bitboard, ByColor, Chess, FromSetup, Position, Setup};
@@ -173,13 +173,13 @@ fn get_move_after_match(
         // Log query turn for Exact queries
         match query {
             PositionQuery::Exact(ref data) => {
-                println!(
-                    "DEBUG get_move_after_match: starting position matches. query exact turn: {:?}",
+                debug!(
+                    "get_move_after_match: starting position matches. query exact turn: {:?}",
                     data.position.turn()
                 );
             }
             _ => {
-                println!("DEBUG get_move_after_match: starting position matches. query not Exact");
+                debug!("get_move_after_match: starting position matches. query not Exact");
             }
         }
         // Defensive decode without unwrap; add debug if decode_move returns None
@@ -190,13 +190,13 @@ fn get_move_after_match(
                 return Ok(Some(san.to_string()));
             }
             None => {
-                println!(
-                    "DEBUG get_move_after_match: decode_move returned None for first byte. move_blob={:?} first_byte={:?} legal_moves_count={}",
+                debug!(
+                    "get_move_after_match: decode_move returned None for first byte. move_blob={:?} first_byte={:?} legal_moves_count={}",
                     move_blob,
                     move_blob.get(0),
                     chess.legal_moves().len()
                 );
-                println!("DEBUG chess position: {:?}", chess);
+                debug!("chess position: {:?}", chess);
                 return Ok(None);
             }
         }
@@ -204,8 +204,8 @@ fn get_move_after_match(
 
     for (i, byte) in move_blob.iter().enumerate() {
         // Log the current turn and number of legal moves at this ply for debugging
-        println!(
-            "DEBUG get_move_after_match: loop ply {} chess.turn={:?} legal_moves_count={}",
+        debug!(
+            "get_move_after_match: loop ply {} chess.turn={:?} legal_moves_count={}",
             i,
             chess.turn(),
             chess.legal_moves().len()
@@ -213,14 +213,14 @@ fn get_move_after_match(
         let m = match decode_move(*byte, &chess) {
             Some(mv) => mv,
             None => {
-                println!(
-                    "DEBUG get_move_after_match: decode_move returned None at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
+                debug!(
+                    "get_move_after_match: decode_move returned None at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
                     i,
                     byte,
                     chess.legal_moves().len(),
                     move_blob
                 );
-                println!("DEBUG chess position at failure: {:?}", chess);
+                debug!("chess position at failure: {:?}", chess);
                 return Ok(None);
             }
         };
@@ -239,14 +239,14 @@ fn get_move_after_match(
                     return Ok(Some(san.to_string()));
                 }
                 None => {
-                    println!(
-                        "DEBUG get_move_after_match: decode_move returned None for next_move at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
+                    debug!(
+                        "get_move_after_match: decode_move returned None for next_move at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
                         i + 1,
                         move_blob.get(i + 1),
                         chess.legal_moves().len(),
                         move_blob
                     );
-                    println!("DEBUG chess position when expecting next move: {:?}", chess);
+                    debug!("chess position when expecting next move: {:?}", chess);
                     return Ok(None);
                 }
             }
@@ -257,8 +257,8 @@ fn get_move_after_match(
         let material = get_material_count(board);
         let pawn_home = get_pawn_home(board);
         if !query.is_reachable_by(&material, pawn_home) {
-            println!(
-                "DEBUG get_move_after_match: position not reachable after applying move index {}. pawn_home={:#06x} material={{white:{},black:{}}} chess={:?}",
+            debug!(
+                "get_move_after_match: position not reachable after applying move index {}. pawn_home={:#06x} material={{white:{},black:{}}} chess={:?}",
                 i,
                 pawn_home,
                 material.white,
@@ -324,7 +324,7 @@ pub async fn search_position(
 
     let processed = AtomicUsize::new(0);
 
-    println!("start search on {tab_id}");
+    debug!("start search on {tab_id}");
 
     games.par_iter().for_each(
         |(
