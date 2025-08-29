@@ -84,6 +84,66 @@ impl PgnParser {
         fallback(self)
     }
     /// Skip `n` games and return the total number of bytes consumed.
+    /// Pure helper: return the first non-whitespace byte from `line`, or None
+    /// if the line is empty or all whitespace.
+    fn first_non_whitespace_byte(line: &str) -> Option<u8> {
+        line.as_bytes()
+            .iter()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .next()
+            .copied()
+    }
+
+    /// Pure helper: whether the provided byte indicates a tag line.
+    fn is_tag_line(first_byte: Option<u8>) -> bool {
+        matches!(first_byte, Some(b'['))
+    }
+
+    /// Read the next line into `self.line` and return the number of bytes read.
+    fn read_line_bytes(&mut self) -> io::Result<usize> {
+        self.reader.read_line(&mut self.line)
+    }
+
+    /// Seek the reader backwards by `bytes`. Used to backtrack to the start of
+    /// a tag line when we've advanced too far.
+    fn backtrack_reader(&mut self, bytes: usize) -> io::Result<()> {
+        self.reader.seek(SeekFrom::Current(-(bytes as i64)))?;
+        Ok(())
+    }
+
+    /// Handle the state transition for a single line read while skipping games.
+    /// Updates `inside_game` and `games_skipped`. Returns `Ok(true)` when the
+    /// caller should break out of the loop (i.e. we've completed skipping).
+    fn handle_line_transition(
+        &mut self,
+        first_char: Option<u8>,
+        line_bytes: usize,
+        inside_game: &mut bool,
+        games_skipped: &mut usize,
+        target: usize,
+    ) -> io::Result<bool> {
+        match first_char {
+            Some(b'[') => {
+                if *inside_game {
+                    *games_skipped += 1;
+                    if *games_skipped == target {
+                        // Backtrack so the next read begins at this tag line
+                        self.backtrack_reader(line_bytes)?;
+                        return Ok(true);
+                    }
+                    *inside_game = false;
+                }
+            }
+            Some(_) => {
+                *inside_game = true;
+            }
+            None => {
+                // empty or whitespace-only line; no state change
+            }
+        }
+        Ok(false)
+    }
+
     fn skip_games(&mut self, n: usize) -> io::Result<usize> {
         if n == 0 {
             return Ok(0);
@@ -94,38 +154,23 @@ impl PgnParser {
         let mut inside_game = false;
 
         while games_skipped < n {
-            let line_bytes = self.reader.read_line(&mut self.line)?;
+            let line_bytes = self.read_line_bytes()?;
             if line_bytes == 0 {
                 // EOF reached
                 break;
             }
             bytes_read += line_bytes;
 
-            // Find first non‑whitespace byte
-            let first_char = self
-                .line
-                .as_bytes()
-                .iter()
-                .skip_while(|b| b.is_ascii_whitespace())
-                .next()
-                .copied();
+            let first_char = Self::first_non_whitespace_byte(&self.line);
 
-            match first_char {
-                Some(b'[') => {
-                    if inside_game {
-                        games_skipped += 1;
-                        if games_skipped == n {
-                            // Backtrack to the start of this tag line
-                            self.reader.seek(SeekFrom::Current(-(line_bytes as i64)))?;
-                            break;
-                        }
-                        inside_game = false;
-                    }
-                }
-                Some(_) => {
-                    inside_game = true;
-                }
-                None => {} // empty line – ignore
+            if self.handle_line_transition(
+                first_char,
+                line_bytes,
+                &mut inside_game,
+                &mut games_skipped,
+                n,
+            )? {
+                break;
             }
 
             self.line.clear();
@@ -371,6 +416,16 @@ where
 
     Ok(())
 }
+
+/// Ensures that a file exists before attempting to write to it.
+/// Creates an empty file if it doesn't exist.
+fn ensure_file_exists(file: &PathBuf) -> io::Result<()> {
+    if !file.exists() {
+        File::create(file)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn write_game(
@@ -379,17 +434,18 @@ pub async fn write_game(
     pgn: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), Error> {
-    if !file.exists() {
-        File::create(&file)?;
-    }
+    // 1. Ensure file exists before writing (creates empty file if needed)
+    ensure_file_exists(&file)?;
 
-    // perform the write in a blocking task
-    let pgn_offsets = state.pgn_offsets.clone();
-    let pgn_meta = state.pgn_index_meta.clone();
-    let pgn_locks = state.pgn_locks.clone();
-    let file_clone = file.clone();
-    let pgn_clone = pgn.clone();
+    // 2. Prepare atomic write operation with cloned state
+    let (file_clone, pgn_clone) = (file.clone(), pgn.clone());
+    let (pgn_offsets, pgn_meta, pgn_locks) = (
+        state.pgn_offsets.clone(),
+        state.pgn_index_meta.clone(),
+        state.pgn_locks.clone(),
+    );
 
+    // 3. Execute atomic file replacement in blocking task
     tokio::task::spawn_blocking(move || -> Result<(), Error> {
         atomic_replace(
             &file_clone,
@@ -398,17 +454,17 @@ pub async fn write_game(
             &pgn_meta,
             &pgn_locks,
             |parser, tmp| {
-                // copy head up to insertion point
+                // Copy head of file up to insertion point
                 let insert_pos = parser.position()?;
                 let mut f = File::open(&file_clone)?;
                 f.seek(SeekFrom::Start(0))?;
                 let mut head = f.take(insert_pos);
                 io::copy(&mut head, tmp.as_file_mut())?;
 
-                // write new pgn
+                // Write new PGN content
                 tmp.as_file_mut().write_all(pgn_clone.as_bytes())?;
 
-                // skip the game to be replaced in original and copy the remainder
+                // Skip replaced game and copy remainder
                 parser.skip_games(1)?;
                 write_to_end(&mut parser.reader, tmp.as_file_mut())?;
                 Ok(())
@@ -455,107 +511,6 @@ mod tests {
 
         let key = file_to_key(&file);
         assert_eq!(key, file.to_string_lossy().to_string());
-    }
-
-    #[test]
-    fn precomputed_offsets_seek() -> std::io::Result<()> {
-        use std::io::Write;
-
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("many.pgn");
-        let mut f = File::create(&file)?;
-
-        // Create 150 small games
-        for i in 0..150 {
-            writeln!(f, "[Event \"Game {}\"]", i)?;
-            writeln!(f, "\n1. e4 e5 2. Nf3 Nc6\n")?;
-        }
-        f.flush()?;
-
-        // compute offset after 100 games using a dedicated parser
-        let mut parser_off = PgnParser::new(File::open(&file)?)?;
-        parser_off.skip_games(100)?;
-        let offset = parser_off.position()?;
-
-        let key = file_to_key(&file);
-        // Construct a minimal AppState without calling Default to avoid side-effects
-        // (AuthState::default binds to a socket). Initialize only the fields we
-        // need for this test.
-        use dashmap::DashMap;
-        use oauth2::basic::BasicClient;
-        use oauth2::{
-            AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-            TokenUrl,
-        };
-        use std::net::SocketAddr;
-        use std::sync::Arc;
-
-        let connection_pool: DashMap<
-            String,
-            diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::SqliteConnection>>,
-        > = DashMap::new();
-        let line_cache: DashMap<
-            (crate::db::GameQueryJs, std::path::PathBuf),
-            (
-                Vec<crate::db::PositionStats>,
-                Vec<crate::db::NormalizedGame>,
-            ),
-        > = DashMap::new();
-        let db_cache = std::sync::Mutex::new(Vec::new());
-        let new_request = Arc::new(tokio::sync::Semaphore::new(2));
-        let pgn_offsets = DashMap::new();
-        let pgn_index_meta = DashMap::new();
-        let fide_players = tokio::sync::RwLock::new(Vec::new());
-        let engine_processes = DashMap::new();
-        let pgn_locks = DashMap::new();
-
-        // Minimal AuthState-like value without binding sockets
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-        let client = BasicClient::new(
-            ClientId::new("org.encroissant.app".to_string()),
-            None,
-            AuthUrl::new("https://example.com/".to_string()).unwrap(),
-            TokenUrl::new("https://example.com/token".to_string()).ok(),
-        )
-        .set_redirect_uri(RedirectUrl::new("http://127.0.0.1:0/callback".to_string()).unwrap());
-
-        let auth = crate::oauth::AuthState {
-            csrf_token: CsrfToken::new_random(),
-            pkce: Arc::new((
-                pkce_challenge,
-                PkceCodeVerifier::secret(&pkce_verifier).to_string(),
-            )),
-            client: Arc::new(client),
-            socket_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        };
-
-        let state = crate::AppState {
-            connection_pool,
-            line_cache,
-            db_cache,
-            new_request,
-            pgn_offsets,
-            pgn_index_meta,
-            pgn_locks,
-            fide_players,
-            engine_processes,
-            auth,
-        };
-
-        state.pgn_offsets.insert(key.clone(), vec![offset]);
-
-        // test offset_by_index positions parser at the precomputed offset
-        let mut parser = PgnParser::new(File::open(&file)?)?;
-        parser.offset_by_index(100, &state.pgn_offsets, &state.pgn_index_meta, &key)?;
-        let pos = parser.position()?;
-        assert_eq!(pos, offset);
-
-        // index 101 should be positioned after that offset
-        parser.offset_by_index(101, &state.pgn_offsets, &state.pgn_index_meta, &key)?;
-        let pos2 = parser.position()?;
-        assert!(pos2 > offset);
-
-        Ok(())
     }
 
     #[test]

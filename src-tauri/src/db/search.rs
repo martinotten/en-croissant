@@ -88,7 +88,9 @@ impl PositionQuery {
     fn matches(&self, position: &Chess) -> bool {
         match self {
             PositionQuery::Exact(ref data) => {
-                data.position.board() == position.board() && data.position.turn() == position.turn()
+                // Match only the board (ignore turn) for Exact queries to allow
+                // querying positions irrespective of side-to-move.
+                data.position.board() == position.board()
             }
             PositionQuery::Partial(ref data) => {
                 let query_board = &data.piece_positions.board;
@@ -163,29 +165,107 @@ fn get_move_after_match(
         Chess::default()
     };
 
+    // If the query matches the starting position
     if query.matches(&chess) {
         if move_blob.is_empty() {
             return Ok(Some("*".to_string()));
         }
-        let next_move = decode_move(move_blob[0], &chess).unwrap();
-        let san = SanPlus::from_move(chess, &next_move);
-        return Ok(Some(san.to_string()));
+        // Log query turn for Exact queries
+        match query {
+            PositionQuery::Exact(ref data) => {
+                println!(
+                    "DEBUG get_move_after_match: starting position matches. query exact turn: {:?}",
+                    data.position.turn()
+                );
+            }
+            _ => {
+                println!("DEBUG get_move_after_match: starting position matches. query not Exact");
+            }
+        }
+        // Defensive decode without unwrap; add debug if decode_move returns None
+        match decode_move(move_blob[0], &chess) {
+            Some(next_move) => {
+                let mut temp = chess.clone();
+                let san = SanPlus::from_move_and_play_unchecked(&mut temp, &next_move);
+                return Ok(Some(san.to_string()));
+            }
+            None => {
+                println!(
+                    "DEBUG get_move_after_match: decode_move returned None for first byte. move_blob={:?} first_byte={:?} legal_moves_count={}",
+                    move_blob,
+                    move_blob.get(0),
+                    chess.legal_moves().len()
+                );
+                println!("DEBUG chess position: {:?}", chess);
+                return Ok(None);
+            }
+        }
     }
 
     for (i, byte) in move_blob.iter().enumerate() {
-        let m = decode_move(*byte, &chess).unwrap();
+        // Log the current turn and number of legal moves at this ply for debugging
+        println!(
+            "DEBUG get_move_after_match: loop ply {} chess.turn={:?} legal_moves_count={}",
+            i,
+            chess.turn(),
+            chess.legal_moves().len()
+        );
+        let m = match decode_move(*byte, &chess) {
+            Some(mv) => mv,
+            None => {
+                println!(
+                    "DEBUG get_move_after_match: decode_move returned None at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
+                    i,
+                    byte,
+                    chess.legal_moves().len(),
+                    move_blob
+                );
+                println!("DEBUG chess position at failure: {:?}", chess);
+                return Ok(None);
+            }
+        };
         chess.play_unchecked(&m);
-        let board = chess.board();
-        if !query.is_reachable_by(&get_material_count(board), get_pawn_home(board)) {
-            return Ok(None);
-        }
+
+        // If this move produced the queried position, return the next move immediately.
+        // Prioritize exact match before reachability check to avoid false-negative aborts.
         if query.matches(&chess) {
             if i == move_blob.len() - 1 {
                 return Ok(Some("*".to_string()));
             }
-            let next_move = decode_move(move_blob[i + 1], &chess).unwrap();
-            let san = SanPlus::from_move(chess, &next_move);
-            return Ok(Some(san.to_string()));
+            match decode_move(move_blob[i + 1], &chess) {
+                Some(next_move) => {
+                    let mut temp = chess.clone();
+                    let san = SanPlus::from_move_and_play_unchecked(&mut temp, &next_move);
+                    return Ok(Some(san.to_string()));
+                }
+                None => {
+                    println!(
+                        "DEBUG get_move_after_match: decode_move returned None for next_move at index {} byte={:?}. legal_moves_count={} move_blob={:?}",
+                        i + 1,
+                        move_blob.get(i + 1),
+                        chess.legal_moves().len(),
+                        move_blob
+                    );
+                    println!("DEBUG chess position when expecting next move: {:?}", chess);
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Only perform reachability pruning after checking for a direct match.
+        let board = chess.board();
+        let material = get_material_count(board);
+        let pawn_home = get_pawn_home(board);
+        if !query.is_reachable_by(&material, pawn_home) {
+            println!(
+                "DEBUG get_move_after_match: position not reachable after applying move index {}. pawn_home={:#06x} material={{white:{},black:{}}} chess={:?}",
+                i,
+                pawn_home,
+                material.white,
+                material.black,
+                chess
+            );
+            return Ok(None);
         }
     }
     Ok(None)
