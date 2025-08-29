@@ -122,24 +122,22 @@ impl PgnParser {
         games_skipped: &mut usize,
         target: usize,
     ) -> io::Result<bool> {
-        match first_char {
-            Some(b'[') => {
-                if *inside_game {
-                    *games_skipped += 1;
-                    if *games_skipped == target {
-                        // Backtrack so the next read begins at this tag line
-                        self.backtrack_reader(line_bytes)?;
-                        return Ok(true);
-                    }
-                    *inside_game = false;
+        // Use the helper to detect tag lines explicitly.
+        if Self::is_tag_line(first_char) {
+            if *inside_game {
+                *games_skipped += 1;
+                if *games_skipped == target {
+                    // Backtrack so the next read begins at this tag line
+                    self.backtrack_reader(line_bytes)?;
+                    return Ok(true);
                 }
+                *inside_game = false;
             }
-            Some(_) => {
-                *inside_game = true;
-            }
-            None => {
-                // empty or whitespace-only line; no state change
-            }
+        } else if first_char.is_some() {
+            // any non-tag, non-whitespace line indicates we're inside move text
+            *inside_game = true;
+        } else {
+            // empty or whitespace-only line; no state change
         }
         Ok(false)
     }
@@ -187,7 +185,8 @@ impl PgnParser {
             if bytes == 0 {
                 break;
             }
-            if self.line.trim_start().starts_with('[') {
+            let first = Self::first_non_whitespace_byte(&self.line);
+            if Self::is_tag_line(first) {
                 if new_game {
                     break;
                 }
@@ -590,7 +589,7 @@ fn atomic_replace_op_failure_releases_lock() -> std::io::Result<()> {
 
     // Ensure the OS-level lock has been released by attempting a non-blocking
     // exclusive lock on the file.
-    let mut f2 = OpenOptions::new().read(true).write(true).open(&file)?;
+    let f2 = OpenOptions::new().read(true).write(true).open(&file)?;
     f2.try_lock_exclusive()?;
     f2.unlock()?;
 
