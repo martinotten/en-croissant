@@ -41,8 +41,12 @@ impl PuzzleCache {
             self.cache.clear();
             self.counter = 0;
 
-            let mut db = diesel::SqliteConnection::establish(file)
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("diesel connection: {}", e))))?;
+            let mut db = diesel::SqliteConnection::establish(file).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("diesel connection: {}", e),
+                ))
+            })?;
             let new_puzzles = puzzles::table
                 .filter(puzzles::rating.le(max_rating as i32))
                 .filter(puzzles::rating.ge(min_rating as i32))
@@ -101,9 +105,12 @@ pub async fn get_puzzle_db_info(
 
     let path = app.path().resolve(db_path, BaseDirectory::AppData)?;
 
-    let mut db =
-        diesel::SqliteConnection::establish(&path.to_string_lossy())
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("diesel connection: {}", e))))?;
+    let mut db = diesel::SqliteConnection::establish(&path.to_string_lossy()).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("diesel connection: {}", e),
+        ))
+    })?;
     let puzzle_count = puzzles::table.count().get_result::<i64>(&mut db)? as i32;
     let storage_size = path.metadata()?.len() as i32;
     let filename = path.file_name().expect("get filename").to_string_lossy();
@@ -117,16 +124,12 @@ pub async fn get_puzzle_db_info(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
 
     #[test]
     fn test_cache_size_limit() {
-        // Test that cache doesn't exceed MAX_CACHE_SIZE
-        let mut cache = PuzzleCache::new();
         // This would test the actual cache size limiting logic
         assert_eq!(MAX_CACHE_SIZE, 100);
     }
@@ -143,7 +146,7 @@ mod tests {
     #[test]
     fn test_cache_eviction() {
         // Test that cache properly evicts old items
-        let mut cache = PuzzleCache::new();
+        let cache = PuzzleCache::new();
         // Verify cache behavior with pop_front eviction
         assert_eq!(cache.cache.len(), 0);
     }
@@ -151,7 +154,7 @@ mod tests {
     #[test]
     fn test_cache_reload_on_rating_change() {
         // Test that cache reloads when ratings change
-        let mut cache = PuzzleCache::new();
+        let cache = PuzzleCache::new();
         // Verify logic for cache reload conditions
         assert_eq!(cache.min_rating, 0);
         assert_eq!(cache.max_rating, 0);
